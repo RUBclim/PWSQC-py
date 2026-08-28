@@ -51,6 +51,100 @@ def test_prepare_timeseries_aggregates_and_fills_gaps() -> None:
     assert result['intern_id'].value_counts().unique().tolist() == [4]
 
 
+def test_prepare_timeseries_carries_additional_columns_along() -> None:
+    df_raw = pd.DataFrame({
+        'intern_id': [1, 1, 2],
+        'date': pd.to_datetime(
+            [
+                '2024-05-01 00:01',
+                '2024-05-01 00:17',
+                '2024-05-01 00:02',
+            ],
+            utc=True,
+        ),
+        'precip': [0.1, 0.5, 0.0],
+        'geometry': ['POINT(1 1)', 'POINT(1 1)', 'POINT(2 2)'],
+        'city_id': [7, 7, 9],
+    })
+    result = prepare_timeseries(df_raw)
+    # the additional columns keep their place and their dtype
+    assert list(result.columns) == [
+        'intern_id', 'date', 'precip', 'geometry', 'city_id',
+    ]
+    assert result['city_id'].dtype == df_raw['city_id'].dtype
+    # the intervals that were added by the resampling get them as well
+    station = result[result['intern_id'] == 1]
+    assert len(station) == 4
+    assert station['geometry'].tolist() == ['POINT(1 1)'] * 4
+    assert station['city_id'].tolist() == [7] * 4
+    assert result[result['intern_id'] == 2]['city_id'].tolist() == [9] * 4
+
+
+def test_prepare_timeseries_keeps_the_selected_columns_only() -> None:
+    df_raw = pd.DataFrame({
+        'intern_id': [1, 2],
+        'date': pd.to_datetime(['2024-05-01 00:01'] * 2, utc=True),
+        'precip': [0.1, 0.0],
+        'geometry': ['POINT(1 1)', 'POINT(2 2)'],
+        'city_id': [7, 9],
+    })
+    result = prepare_timeseries(df_raw, keep_cols=('geometry',))
+    assert list(result.columns) == ['intern_id', 'date', 'precip', 'geometry']
+    result = prepare_timeseries(df_raw, keep_cols=())
+    assert list(result.columns) == ['intern_id', 'date', 'precip']
+
+
+def test_prepare_timeseries_fills_in_a_partly_missing_column() -> None:
+    df_raw = pd.DataFrame({
+        'intern_id': [1, 1, 2],
+        'date': pd.to_datetime(
+            [
+                '2024-05-01 00:01',
+                '2024-05-01 00:07',
+                '2024-05-01 00:02',
+            ],
+            utc=True,
+        ),
+        'precip': [0.1, 0.2, 0.0],
+        'alt': [12.0, np.nan, np.nan],
+    })
+    result = prepare_timeseries(df_raw)
+    # the one value a station reported is used for all of its intervals
+    assert result[result['intern_id'] == 1]['alt'].tolist() == [12.0, 12.0]
+    assert np.isnan(result[result['intern_id'] == 2]['alt']).all()
+
+
+def test_prepare_timeseries_rejects_columns_that_vary_within_a_station() -> None:
+    df_raw = pd.DataFrame({
+        'intern_id': [1, 1],
+        'date': pd.to_datetime(
+            ['2024-05-01 00:01', '2024-05-01 00:07'], utc=True,
+        ),
+        'precip': [0.1, 0.2],
+        'temperature': [17.0, 18.0],
+    })
+    with pytest.raises(ValueError) as exc_info:
+        prepare_timeseries(df_raw)
+    assert "the columns ['temperature'] are not constant" in str(exc_info.value)
+    # ... also when they were asked for explicitly
+    with pytest.raises(ValueError):
+        prepare_timeseries(df_raw, keep_cols=('temperature',))
+    # ... but they can be excluded
+    result = prepare_timeseries(df_raw, keep_cols=())
+    assert list(result.columns) == ['intern_id', 'date', 'precip']
+
+
+def test_prepare_timeseries_unknown_keep_cols() -> None:
+    df_raw = pd.DataFrame({
+        'intern_id': [1],
+        'date': pd.to_datetime(['2024-05-01 00:01'], utc=True),
+        'precip': [0.1],
+    })
+    with pytest.raises(ValueError) as exc_info:
+        prepare_timeseries(df_raw, keep_cols=('geometry',))
+    assert str(exc_info.value) == "Missing required columns: ['geometry']"
+
+
 def test_prepare_timeseries_ignores_exact_duplicates() -> None:
     df_raw = pd.DataFrame({
         'intern_id': [1, 1],

@@ -67,12 +67,44 @@ class Config(NamedTuple):
     dbc: float = 1.24
 
 
+def _station_constants(
+        df_raw: pd.DataFrame,
+        columns: list[str],
+        id_col: str,
+        freq: str,
+) -> pd.DataFrame:
+    """Reduce the columns that are constant within a station to one row each.
+
+    :param df_raw: Input DataFrame in long format.
+    :param columns: Columns to reduce.
+    :param id_col: Column name for station identifier.
+    :param freq: Frequency the time series is resampled to, only used for the
+        error message.
+    :raises ValueError: if one of the columns holds more than one value within a
+        station, it cannot be carried through unchanged then.
+    :return: One row per station with the columns and the station id.
+    """
+    grouped = df_raw.groupby(id_col, sort=False)
+    varying = [
+        col for col in columns if (grouped[col].nunique(dropna=True) > 1).any()
+    ]
+    if varying:
+        raise ValueError(
+            f'the columns {varying} are not constant within a station and cannot '
+            f'be carried through unchanged, aggregate them to {freq!r} yourself '
+            f'or exclude them using keep_cols',
+        )
+    # first() skips the missing values, a station without any value keeps NaN
+    return grouped[columns].first().reset_index()
+
+
 def prepare_timeseries(
         df_raw: pd.DataFrame,
         freq: str = '5min',
         id_col: str = 'intern_id',
         date_col: str = 'date',
         precip_col: str = 'precip',
+        keep_cols: Sequence[str] | None = None,
 ) -> pd.DataFrame:
     """Prepare a time series DataFrame to be ready for PWSQC processing.
 
@@ -81,12 +113,43 @@ def prepare_timeseries(
     - Resampling the data to a uniform frequency (default: 5 minutes).
     - sorting the DataFrame by time and station ID.
 
+    The rows of the result are not the rows of the input: observations within the
+    same interval are summed up and the intervals a station did not report are
+    added as missing values. An additional column can hence only be carried
+    through unchanged if it is constant within a station, which is the case for
+    station metadata such as a location or a city id.
+
     :param df_raw: Input DataFrame with a DatetimeIndex and precipitation data.
     :param freq: Frequency string for resampling (default is '5min').
+    :param id_col: Column name for station identifier.
+    :param date_col: Column name holding the (interval end) timestamps.
+    :param precip_col: Column name holding the rainfall of the interval in mm.
+    :param keep_cols: Additional columns to carry through unchanged, they have to
+        be constant within a station. Defaults to every additional column of
+        ``df_raw``, pass an empty sequence to drop them all.
     :return: Resampled DataFrame with a uniform time index.
     """
+    reserved = (id_col, date_col, precip_col)
+    if keep_cols is None:
+        requested = set(df_raw.columns) - set(reserved)
+    else:
+        requested = set(keep_cols) - set(reserved)
+        missing_cols = requested - set(df_raw.columns)
+        if missing_cols:
+            raise ValueError(f"Missing required columns: {sorted(missing_cols)}")
+    # keep the columns in the order they were given in
+    kept = [col for col in df_raw.columns if col in requested]
+
     # first sort by time and station id
     df_raw = df_raw.sort_values(by=[date_col, id_col]).copy()
+    # the additional columns are checked before the deduplication, dropping rows
+    # could hide that a column is not constant
+    constants = _station_constants(
+        df_raw=df_raw,
+        columns=kept,
+        id_col=id_col,
+        freq=freq,
+    )
     df_raw = df_raw.drop_duplicates(subset=[date_col, id_col, precip_col])
     # check if we have duplicated date and id values but differing precipitation values
     duplicates = df_raw.duplicated(subset=[date_col, id_col], keep=False)
@@ -126,7 +189,12 @@ def prepare_timeseries(
     df = df.reindex(full_index)
     # sort by index to ensure proper order
     df = df.sort_index()
-    return df.reset_index()
+    df = df.reset_index()
+    if kept:
+        # every station of the result has a row in the constants, so this only
+        # broadcasts the values and never introduces a missing value
+        df = df.merge(constants, on=id_col, how='left', validate='many_to_one')
+    return df
 
 
 def _compute_row_distances(
