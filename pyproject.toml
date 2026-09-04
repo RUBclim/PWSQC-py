@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "PWSQC-py"
 version = "0.0.0"
 dependencies = [
+    "numpy",
     "pandas",
     "geopy",
 ]
@@ -31,7 +32,9 @@ Documentation = "https://rubclim.github.io/pwsqc-py/"
 Repository = "https://github.com/RUBclim/pwsqc-py"
 
 [project.optional-dependencies]
+polars = ["polars"]
 dev = [
+    "polars",
     "pytest",
     "coverage",
     "covdefaults",

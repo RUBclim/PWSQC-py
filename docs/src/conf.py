@@ -57,6 +57,7 @@ exclude_patterns: list[str] = []
 intersphinx_mapping = {
     'python': ('https://docs.python.org/3', None),
     'pandas': ('https://pandas.pydata.org/docs', None),
+    'polars': ('https://docs.pola.rs/api/python/stable', None),
     'numpy': ('https://numpy.org/doc/stable', None),
 }
 

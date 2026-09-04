@@ -12,7 +12,9 @@ It reproduces the reference implementation in R
 
 The library works on a long format DataFrame with one row per station and time
 interval, where the timestamp indicates the **end** of the interval and the
-rainfall is the amount that fell **since the previous interval** in mm.
+rainfall is the amount that fell **since the previous interval** in mm. Both
+[pandas](https://pandas.pydata.org) and [polars](https://pola.rs) DataFrames are
+accepted, every function returns a DataFrame of the type it was given.
 
 | intern_id | date                      | precip |
 | --------- | ------------------------- | ------ |
@@ -46,7 +48,10 @@ Every filter adds one column to the DataFrame and leaves the input untouched:
 | `SOflag`    | `station_outlier_filter` | station outlier [info](https://agupubs.onlinelibrary.wiley.com/doi/10.1029/2019GL083731#grl59347-sec-0016)                         |
 | `bias`      | `station_outlier_filter` | median relative bias with the neighbors [info](https://agupubs.onlinelibrary.wiley.com/doi/10.1029/2019GL083731#grl59347-sec-0016) |
 | `BCF`       | `bias_correction`        | bias correction factor of that interval [info](https://agupubs.onlinelibrary.wiley.com/doi/10.1029/2019GL083731#grl59347-sec-0016) |
-| `precip_qc` | `apply_flags`            | corrected rainfall, NaN where flagged                                                                                              |
+| `precip_qc` | `apply_flags`            | corrected rainfall, missing where flagged                                                                                          |
+
+A discarded interval is a `NaN` in pandas and a `null` in polars, each library
+in the way it spells a missing value.
 
 Each flag is `0` (no error), `1` (error) or `-1` (not enough information to
 determine the flag). `apply_flags(strict=False)` only discards the intervals
@@ -56,6 +61,26 @@ intervals flagged with `-1` as well ("filtered strict").
 The filters have to be applied in that order, the station outlier filter needs
 the flags of the two preceding filters and the bias correction needs the output
 of the station outlier filter.
+
+## Performance
+
+The filters reshape the long format into `(time x station)` matrices and do
+their work in numpy, so the choice of DataFrame library hardly affects the
+runtime -- reading the data and preparing the time series are the only stages
+where it shows.
+
+`prepare_timeseries` returns the rows grouped by station and ordered by time.
+Passing that frame straight into the filters lets them reshape it by reshaping
+the buffer instead of mapping every row, which is worth a few seconds per
+filter on a large data set. Any other order still works, it is only slower.
+
+Every filter takes an `n_jobs` argument. `faulty_zero_filter`,
+`high_influx_filter` and `bias_correction` spread their stations over all cores
+by default. `station_outlier_filter` does not: its comparison window sums are
+much larger than the caches, so it is limited by the memory bandwidth rather
+than by the cores. Raising its `n_jobs` still helps somewhat (about 1.6x on
+four threads on a 637 station, 6 week data set) but every thread holds another
+set of those sums, so it costs a considerable amount of memory.
 
 ## Parameters
 

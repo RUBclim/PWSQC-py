@@ -4,6 +4,7 @@ The expected values in ``testing/reference`` were produced by the original
 R code of de Vos et al. (2019), see ``testing/reference/generate.py``.
 """
 import os
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -12,6 +13,8 @@ from pwsqc import bias_correction
 from pwsqc import faulty_zero_filter
 from pwsqc import high_influx_filter
 from pwsqc import station_outlier_filter
+
+from tests.conftest import BACKENDS
 
 REFERENCE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -36,8 +39,8 @@ def _expected(name: str) -> np.ndarray:
     return pd.read_csv(path, float_precision='round_trip').to_numpy(dtype=np.float64)
 
 
-@pytest.fixture(scope='module')
-def reference_data() -> tuple[pd.DataFrame, dict[int, tuple[int, ...]], list[int]]:
+@pytest.fixture(scope='module', params=BACKENDS)
+def reference_data(request) -> tuple[Any, dict[int, tuple[int, ...]], list[int]]:
     wide = pd.read_csv(
         os.path.join(REFERENCE, 'Ndataset.csv.gz'),
         index_col=0,
@@ -49,6 +52,10 @@ def reference_data() -> tuple[pd.DataFrame, dict[int, tuple[int, ...]], list[int
     wide.index = pd.DatetimeIndex(wide.index)
     long = wide.melt(ignore_index=False, var_name='intern_id', value_name='precip')
     data = long.rename_axis('date').reset_index()[['intern_id', 'date', 'precip']]
+    if request.param == 'polars':
+        import polars as pl
+
+        data = pl.from_pandas(data)
 
     neighbor_table = pd.read_csv(
         os.path.join(REFERENCE, 'neighbourlist.csv'),
@@ -65,8 +72,8 @@ def reference_data() -> tuple[pd.DataFrame, dict[int, tuple[int, ...]], list[int
 
 @pytest.fixture(scope='module')
 def qc_result(
-        reference_data: tuple[pd.DataFrame, dict[int, tuple[int, ...]], list[int]],
-) -> pd.DataFrame:
+        reference_data: tuple[Any, dict[int, tuple[int, ...]], list[int]],
+) -> Any:
     data, neighbors, _ = reference_data
     result = faulty_zero_filter(
         data,
@@ -95,10 +102,17 @@ def qc_result(
 
 
 def _as_matrix(
-        result: pd.DataFrame,
+        result: Any,
         column: str,
         station_ids: list[int],
 ) -> np.ndarray:
+    if type(result).__module__.split('.')[0] == 'polars':
+        import polars as pl
+
+        wide = result.pivot(on='intern_id', index='date', values=column)
+        return wide.select(
+            pl.col(str(i)).cast(pl.Float64) for i in station_ids
+        ).to_numpy()
     wide = result.pivot(index='date', columns='intern_id', values=column)
     return wide[station_ids].to_numpy(dtype=np.float64)
 
@@ -112,8 +126,8 @@ def _as_matrix(
     ),
 )
 def test_flags_match_the_reference_implementation(
-        qc_result: pd.DataFrame,
-        reference_data: tuple[pd.DataFrame, dict[int, tuple[int, ...]], list[int]],
+        qc_result: Any,
+        reference_data: tuple[Any, dict[int, tuple[int, ...]], list[int]],
         column: str,
         expected_name: str,
 ) -> None:
@@ -126,8 +140,8 @@ def test_flags_match_the_reference_implementation(
 
 
 def test_bias_correction_matches_the_reference_implementation(
-        qc_result: pd.DataFrame,
-        reference_data: tuple[pd.DataFrame, dict[int, tuple[int, ...]], list[int]],
+        qc_result: Any,
+        reference_data: tuple[Any, dict[int, tuple[int, ...]], list[int]],
 ) -> None:
     _, _, station_ids = reference_data
     expected = _expected('BCF')

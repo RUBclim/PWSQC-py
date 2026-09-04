@@ -9,6 +9,7 @@ from pwsqc import faulty_zero_filter
 from pwsqc import high_influx_filter
 from pwsqc import station_outlier_filter
 from pwsqc.filters import _compare_start
+from pwsqc.filters import _neighbor_correlation_bias
 
 NAN = float('nan')
 
@@ -232,7 +233,7 @@ def test_station_outlier_without_enough_neighbors(make_data, flags_of) -> None:
     data = high_influx_filter(data, neighbors, n_stat=2)
     result = station_outlier_filter(data, neighbors, n_stat=2, m_int=1, m_rain=1)
     assert flags_of(result, 1, 'SOflag') == [-1, -1]
-    assert np.isnan(flags_of(result, 1, 'bias')).all()
+    assert flags_of(result, 1, 'bias') == [None, None]
 
 
 def test_station_outlier_of_a_station_without_observations(make_data, flags_of) -> None:
@@ -246,13 +247,13 @@ def test_station_outlier_of_a_station_without_observations(make_data, flags_of) 
 
 def test_station_outlier_excludes_the_intervals_of_the_other_filters(
         make_data,
+        set_flag,
 ) -> None:
     data = make_data(_outlier_data())
     neighbors = {i: tuple(j for j in range(1, 6) if j != i) for i in range(1, 6)}
     data = faulty_zero_filter(data, neighbors, n_stat=3, n_int=6)
     data = high_influx_filter(data, neighbors, n_stat=3)
-    flagged = data.copy()
-    flagged.loc[flagged['intern_id'] == 1, 'HIflag'] = 1
+    flagged = set_flag(data, station_id=1, column='HIflag', value=1)
     plain = station_outlier_filter(
         data, neighbors, n_stat=3, m_int=20, m_rain=5, m_match=10, gamma=0.5,
     )
@@ -382,3 +383,29 @@ def test_apply_flags_missing_column() -> None:
     with pytest.raises(ValueError) as exc_info:
         apply_flags(_flagged_frame().drop(columns='SOflag'))
     assert str(exc_info.value) == "Missing required columns: ['SOflag']"
+
+
+def test_neighbor_correlation_bias_with_gaps_between_the_windows() -> None:
+    """The intervals a window could be built for need not be consecutive."""
+    rng = np.random.default_rng(0)
+    precip = rng.random(12)
+    neighbor_values = rng.random((12, 3))
+    kwargs: dict[str, Any] = {
+        'precip': precip,
+        'neighbor_values': neighbor_values,
+        'n_stat': 2,
+        'm_match': 1,
+        'dbc': 1.24,
+    }
+    consecutive = np.array([-1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    with_gaps = consecutive.copy()
+    with_gaps[[3, 5, 8]] = -1
+
+    everything = _neighbor_correlation_bias(start=consecutive, **kwargs)
+    some = _neighbor_correlation_bias(start=with_gaps, **kwargs)
+    kept = with_gaps >= 0
+    for whole, part in zip(everything, some):
+        # the intervals that were left out have no result ...
+        assert np.isnan(part[~kept]).all()
+        # ... and the others are the ones they are without the gaps
+        assert np.array_equal(whole[kept], part[kept], equal_nan=True)

@@ -1,13 +1,17 @@
 from collections.abc import Mapping
 from collections.abc import Sequence
+from typing import Any
 
 import numpy as np
-import pandas as pd
 from numpy.typing import NDArray
 
+from . import _frames
+from ._frames import FrameT
 from .utils import _neighbor_index
 from .utils import _neighbor_stats
 from .utils import _rle
+from .utils import _row_nanmedian
+from .utils import _run
 from .utils import _to_long
 from .utils import _to_wide
 
@@ -62,7 +66,7 @@ def _faulty_zero_flags(
 
 
 def faulty_zero_filter(
-        data: pd.DataFrame,
+        data: FrameT,
         neighbors: Mapping[int, Sequence[int]],
         n_stat: int = 5,
         n_int: int = 6,
@@ -70,7 +74,8 @@ def faulty_zero_filter(
         date_col: str = 'date',
         precip_col: str = 'precip',
         flag_col: str = 'FZflag',
-) -> pd.DataFrame:
+        n_jobs: int | None = None,
+) -> FrameT:
     """Apply the Faulty Zero (FZ) filter to the precipitation data.
 
     A station is compared with the median of its neighboring stations. The flag is
@@ -81,7 +86,8 @@ def faulty_zero_filter(
     whenever fewer than ``n_stat`` neighboring stations report an observation.
 
     :param data: Long format DataFrame with a regular time series per station, as
-        returned by :func:`pwsqc.prepare_timeseries`.
+        returned by :func:`pwsqc.prepare_timeseries`. Either a
+        :class:`pandas.DataFrame` or a :class:`polars.DataFrame`.
     :param neighbors: Mapping of a station id to the ids of its neighbors, as
         returned by :func:`pwsqc.find_station_neighbors`.
     :param n_stat: Minimum number of neighboring stations with an observation.
@@ -91,28 +97,34 @@ def faulty_zero_filter(
     :param date_col: Column name holding the (interval end) timestamps.
     :param precip_col: Column name holding the rainfall of the interval in mm.
     :param flag_col: Name of the column the flags are written to.
+    :param n_jobs: Number of threads to spread the stations over. Defaults to
+        os.cpu_count().
     :return: DataFrame with an additional ``FZflag`` column indicating flagged data
         points.
     """
-    (values,), times, station_ids = _to_wide(
+    (values,), layout = _to_wide(
         data=data,
         id_col=id_col,
         date_col=date_col,
         value_cols=(precip_col,),
     )
+    station_ids = layout.station_ids
     neighbor_index = _neighbor_index(neighbors=neighbors, station_ids=station_ids)
-    med, cnt = _neighbor_stats(values=values, neighbor_index=neighbor_index)
+    med, cnt = _neighbor_stats(
+        values=values, neighbor_index=neighbor_index, n_jobs=n_jobs,
+    )
 
     flags = np.zeros(values.shape, dtype=np.int8)
-    for i, station_id in enumerate(station_ids):
+
+    def _station(i: int) -> None:
         # a station without any observation or with too few neighbors cannot be
         # evaluated at all
         if (
-                len(neighbors.get(station_id, ())) < n_stat or
+                len(neighbors.get(station_ids[i], ())) < n_stat or
                 np.isnan(values[:, i]).all()
         ):
             flags[:, i] = NOT_ENOUGH_INFO
-            continue
+            return
 
         # binary reference of the surrounding area, NaN where the median could not
         # be constructed from at least n_stat stations
@@ -126,20 +138,15 @@ def faulty_zero_filter(
         # if too few neighbors have observations the flag cannot be attributed
         flags[cnt[:, i] < n_stat, i] = NOT_ENOUGH_INFO
 
-    result = data.copy()
-    result[flag_col] = _to_long(
-        data=data,
-        values=flags,
-        times=times,
-        station_ids=station_ids,
-        id_col=id_col,
-        date_col=date_col,
-    ).astype(np.int8)
-    return result
+    _run(_station, range(station_ids.size), n_jobs)
+
+    return _frames.with_columns(
+        data, {flag_col: _to_long(layout, flags).astype(np.int8)},
+    )
 
 
 def high_influx_filter(
-        data: pd.DataFrame,
+        data: FrameT,
         neighbors: Mapping[int, Sequence[int]],
         n_stat: int = 5,
         phi_a: float = 0.4,
@@ -148,7 +155,8 @@ def high_influx_filter(
         date_col: str = 'date',
         precip_col: str = 'precip',
         flag_col: str = 'HIflag',
-) -> pd.DataFrame:
+        n_jobs: int | None = None,
+) -> FrameT:
     """Apply the High Influx (HI) filter to the precipitation data.
 
     A rainfall measurement that is significantly larger than the median of the
@@ -159,7 +167,8 @@ def high_influx_filter(
     neighboring stations report an observation.
 
     :param data: Long format DataFrame with a regular time series per station, as
-        returned by :func:`pwsqc.prepare_timeseries`.
+        returned by :func:`pwsqc.prepare_timeseries`. Either a
+        :class:`pandas.DataFrame` or a :class:`polars.DataFrame`.
     :param neighbors: Mapping of a station id to the ids of its neighbors, as
         returned by :func:`pwsqc.find_station_neighbors`.
     :param n_stat: Minimum number of neighboring stations with an observation.
@@ -169,17 +178,22 @@ def high_influx_filter(
     :param date_col: Column name holding the (interval end) timestamps.
     :param precip_col: Column name holding the rainfall of the interval in mm.
     :param flag_col: Name of the column the flags are written to.
+    :param n_jobs: Number of threads to spread the stations over. Defaults to
+        os.cpu_count().
     :return: DataFrame with an additional ``HIflag`` column indicating flagged data
         points.
     """
-    (values,), times, station_ids = _to_wide(
+    (values,), layout = _to_wide(
         data=data,
         id_col=id_col,
         date_col=date_col,
         value_cols=(precip_col,),
     )
+    station_ids = layout.station_ids
     neighbor_index = _neighbor_index(neighbors=neighbors, station_ids=station_ids)
-    med, cnt = _neighbor_stats(values=values, neighbor_index=neighbor_index)
+    med, cnt = _neighbor_stats(
+        values=values, neighbor_index=neighbor_index, n_jobs=n_jobs,
+    )
 
     # comparisons with NaN are always False, so intervals without an observation
     # of the station itself or without a median are never flagged
@@ -200,16 +214,9 @@ def high_influx_filter(
     unusable = (n_neighbors < n_stat) | np.isnan(values).all(axis=0)
     flags[:, unusable] = NOT_ENOUGH_INFO
 
-    result = data.copy()
-    result[flag_col] = _to_long(
-        data=data,
-        values=flags,
-        times=times,
-        station_ids=station_ids,
-        id_col=id_col,
-        date_col=date_col,
-    ).astype(np.int8)
-    return result
+    return _frames.with_columns(
+        data, {flag_col: _to_long(layout, flags).astype(np.int8)},
+    )
 
 
 def _compare_start(
@@ -252,6 +259,23 @@ def _compare_start(
     return start
 
 
+def _prefix(
+        values: NDArray[Any],
+        dtype: type[np.generic],
+) -> NDArray[Any]:
+    """Cumulative sums of the columns, with a row of zeros in front of them.
+
+    The result is allocated in one piece and the cumulative sum is written into
+    it directly, so that the large matrices are not copied again to prepend the
+    zeros. Both sides are laid out column by column, so that the sum of a column
+    runs along contiguous memory instead of jumping a row at every step, which
+    is what makes the difference for the extended precision sums.
+    """
+    out = np.zeros((values.shape[0] + 1, values.shape[1]), dtype=dtype, order='F')
+    np.cumsum(np.asfortranarray(values), axis=0, dtype=dtype, out=out[1:])
+    return out
+
+
 def _neighbor_correlation_bias(
         precip: NDArray[np.float64],
         neighbor_values: NDArray[np.float64],
@@ -286,34 +310,35 @@ def _neighbor_correlation_bias(
     x = np.where(overlap, neighbor_values, 0.0)
     y = np.where(overlap, precip[:, None], 0.0)
 
-    def _prefix(values: NDArray[np.float64]) -> NDArray[np.longdouble]:
-        # the cumulative sums are accumulated with extended precision, so that
-        # the window sums stay accurate over very long time series
-        return np.concatenate(
-            (
-                np.zeros((1, values.shape[1]), dtype=np.longdouble),
-                np.cumsum(values, axis=0, dtype=np.longdouble),
-            ),
-        )
-
-    c_n = _prefix(overlap.astype(np.float64))
-    c_x = _prefix(x)
-    c_y = _prefix(y)
-    c_xx = _prefix(x * x)
-    c_yy = _prefix(y * y)
-    c_xy = _prefix(x * y)
+    # the cumulative sums of the values are accumulated with extended precision,
+    # so that the window sums stay accurate over very long time series. The
+    # overlapping intervals are counted, whole numbers that int64 holds exactly
+    # and accumulates an order of magnitude faster
+    c_n = _prefix(overlap, np.int64)
+    c_x = _prefix(x, np.longdouble)
+    c_y = _prefix(y, np.longdouble)
+    c_xx = _prefix(x * x, np.longdouble)
+    c_yy = _prefix(y * y, np.longdouble)
+    c_xy = _prefix(x * y, np.longdouble)
+    del overlap, x, y
 
     rows = np.flatnonzero(start >= 0)
     for offset in range(0, rows.size, chunk_size):
         chunk = rows[offset:offset + chunk_size]
         lo = start[chunk]
-        hi = chunk + 1
-        count = (c_n[hi] - c_n[lo]).astype(np.float64)
-        sum_x = (c_x[hi] - c_x[lo]).astype(np.float64)
-        sum_y = (c_y[hi] - c_y[lo]).astype(np.float64)
-        sum_xx = (c_xx[hi] - c_xx[lo]).astype(np.float64)
-        sum_yy = (c_yy[hi] - c_yy[lo]).astype(np.float64)
-        sum_xy = (c_xy[hi] - c_xy[lo]).astype(np.float64)
+        ends: Any
+        if chunk[-1] - chunk[0] + 1 == chunk.size:
+            # the ends of the windows of a chunk are usually consecutive, then
+            # they can be sliced out instead of gathered row by row
+            ends = np.s_[chunk[0] + 1:chunk[-1] + 2]
+        else:
+            ends = chunk + 1
+        count = (c_n[ends] - c_n[lo]).astype(np.float64)
+        sum_x = (c_x[ends] - c_x[lo]).astype(np.float64)
+        sum_y = (c_y[ends] - c_y[lo]).astype(np.float64)
+        sum_xx = (c_xx[ends] - c_xx[lo]).astype(np.float64)
+        sum_yy = (c_yy[ends] - c_yy[lo]).astype(np.float64)
+        sum_xy = (c_xy[ends] - c_xy[lo]).astype(np.float64)
 
         # only neighbors with enough overlapping intervals are considered and
         # only if there are enough of those neighbors
@@ -337,16 +362,18 @@ def _neighbor_correlation_bias(
         cor = np.where(selected, cor, np.nan)
         bias = np.where(selected, bias, np.nan)
         # the flag depends on the number of neighbors the correlation is known of
-        enough = np.count_nonzero(~np.isnan(cor), axis=1) >= n_stat
-        med_cor[chunk[enough]] = np.nanmedian(cor[enough], axis=1)
-        enough_bias = np.count_nonzero(~np.isnan(bias), axis=1) > 0
-        med_bias[chunk[enough_bias]] = np.nanmedian(bias[enough_bias], axis=1)
+        cor_median, cor_count = _row_nanmedian(cor)
+        enough = cor_count >= n_stat
+        med_cor[chunk[enough]] = cor_median[enough]
+        bias_median, bias_count = _row_nanmedian(bias)
+        enough_bias = bias_count > 0
+        med_bias[chunk[enough_bias]] = bias_median[enough_bias]
 
     return med_cor, med_bias
 
 
 def station_outlier_filter(
-        data: pd.DataFrame,
+        data: FrameT,
         neighbors: Mapping[int, Sequence[int]],
         n_stat: int = 5,
         m_int: int = 4032,
@@ -361,7 +388,8 @@ def station_outlier_filter(
         hi_col: str = 'HIflag',
         flag_col: str = 'SOflag',
         bias_col: str = 'bias',
-) -> pd.DataFrame:
+        n_jobs: int | None = 1,
+) -> FrameT:
     """Apply the Station Outlier (SO) filter to the precipitation data.
 
     A station is an outlier when it shows very different rainfall dynamics than its
@@ -379,7 +407,8 @@ def station_outlier_filter(
     column, it is the input of :func:`pwsqc.bias_correction`.
 
     :param data: Long format DataFrame with a regular time series per station and
-        the flags of the FZ and the HI filter.
+        the flags of the FZ and the HI filter. Either a
+        :class:`pandas.DataFrame` or a :class:`polars.DataFrame`.
     :param neighbors: Mapping of a station id to the ids of its neighbors, as
         returned by :func:`pwsqc.find_station_neighbors`.
     :param n_stat: Minimum number of neighboring stations to compare with.
@@ -396,39 +425,51 @@ def station_outlier_filter(
     :param hi_col: Column name holding the flags of the HI filter.
     :param flag_col: Name of the column the flags are written to.
     :param bias_col: Name of the column the median relative bias is written to.
+    :param n_jobs: Number of threads to spread the stations over. Defaults to
+        one: the comparison window sums of a station are far larger than the
+        caches, so this loop is limited by the memory bandwidth rather than by
+        the cores and more threads buy little while every one of them holds
+        another set of those sums.
     :return: DataFrame with an additional ``SOflag`` column indicating flagged data
         points and a ``bias`` column with the median relative bias.
     """
-    (values, fz, hi), times, station_ids = _to_wide(
+    (values, fz, hi), layout = _to_wide(
         data=data,
         id_col=id_col,
         date_col=date_col,
         value_cols=(precip_col, fz_col, hi_col),
     )
+    station_ids = layout.station_ids
     neighbor_index = _neighbor_index(neighbors=neighbors, station_ids=station_ids)
 
     # the outlier is determined on the intervals that were not flagged already,
-    # the correction factor is constant and does not affect the correlation
+    # the correction factor is constant and does not affect the correlation.
+    # Every station is a column here and the whole comparison runs along it, so
+    # the working set is laid out column by column: the time series of a station
+    # and of its neighbors are then contiguous all the way into the window sums
     shape = values.shape
-    corrected = values * dbc
+    corrected = np.asfortranarray(values * dbc)
     corrected[(fz == FLAG) | (hi == FLAG)] = np.nan
     # the matrices are large for long time series, release them right away
     del values, fz, hi
 
-    flags = np.zeros(shape, dtype=np.int8)
-    bias = np.full(shape, np.nan)
-    for i, station_id in enumerate(station_ids):
+    flags = np.zeros(shape, dtype=np.int8, order='F')
+    bias = np.full(shape, np.nan, order='F')
+
+    def _station(i: int) -> None:
         precip = corrected[:, i]
         # a station without any observation or with too few neighbors cannot be
         # evaluated at all
         if (
-                len(neighbors.get(station_id, ())) < n_stat or
+                len(neighbors.get(station_ids[i], ())) < n_stat or
                 np.isnan(precip).all()
         ):
             flags[:, i] = NOT_ENOUGH_INFO
-            continue
+            return
 
-        neighbor_values = corrected[:, neighbor_index[i]].copy()
+        # indexing the columns copies them out already, this only keeps the
+        # column by column layout of the copy
+        neighbor_values = np.asfortranarray(corrected[:, neighbor_index[i]])
         # intervals without an observation of the station itself do not overlap
         neighbor_values[np.isnan(precip)] = np.nan
 
@@ -445,24 +486,15 @@ def station_outlier_filter(
         flags[np.isnan(med_cor), i] = NOT_ENOUGH_INFO
         bias[:, i] = med_bias
 
-    result = data.copy()
-    result[flag_col] = _to_long(
-        data=data,
-        values=flags,
-        times=times,
-        station_ids=station_ids,
-        id_col=id_col,
-        date_col=date_col,
-    ).astype(np.int8)
-    result[bias_col] = _to_long(
-        data=data,
-        values=bias,
-        times=times,
-        station_ids=station_ids,
-        id_col=id_col,
-        date_col=date_col,
+    _run(_station, range(station_ids.size), n_jobs)
+
+    return _frames.with_columns(
+        data,
+        {
+            flag_col: _to_long(layout, flags).astype(np.int8),
+            bias_col: _to_long(layout, bias),
+        },
     )
-    return result
 
 
 def _bias_correction_factors(
@@ -509,7 +541,7 @@ def _bias_correction_factors(
 
 
 def bias_correction(
-        data: pd.DataFrame,
+        data: FrameT,
         dbc: float = 1.24,
         beta: float = 0.2,
         id_col: str = 'intern_id',
@@ -517,7 +549,8 @@ def bias_correction(
         so_col: str = 'SOflag',
         bias_col: str = 'bias',
         bcf_col: str = 'BCF',
-) -> pd.DataFrame:
+        n_jobs: int | None = None,
+) -> FrameT:
     """Compute the bias correction factor of every station and interval.
 
     Every station starts out with the default bias correction factor ``dbc``.
@@ -529,7 +562,8 @@ def bias_correction(
     The bias corrected rainfall of an interval is ``precip * BCF``.
 
     :param data: Long format DataFrame with the ``SOflag`` and ``bias`` columns of
-        :func:`pwsqc.station_outlier_filter`.
+        :func:`pwsqc.station_outlier_filter`. Either a
+        :class:`pandas.DataFrame` or a :class:`polars.DataFrame`.
     :param dbc: The default bias correction factor.
     :param beta: Relative threshold a change of the factor has to exceed.
     :param id_col: Column name for station identifier.
@@ -537,9 +571,11 @@ def bias_correction(
     :param so_col: Column name holding the flags of the SO filter.
     :param bias_col: Column name holding the median relative bias.
     :param bcf_col: Name of the column the correction factors are written to.
+    :param n_jobs: Number of threads to spread the stations over. Defaults to
+        os.cpu_count().
     :return: DataFrame with an additional ``BCF`` column.
     """
-    (bias, flags), times, station_ids = _to_wide(
+    (bias, flags), layout = _to_wide(
         data=data,
         id_col=id_col,
         date_col=date_col,
@@ -547,7 +583,8 @@ def bias_correction(
     )
 
     factors = np.empty(bias.shape)
-    for i in range(station_ids.size):
+
+    def _station(i: int) -> None:
         factors[:, i] = _bias_correction_factors(
             bias=bias[:, i],
             flags=flags[:, i].astype(np.int8),
@@ -555,29 +592,23 @@ def bias_correction(
             beta=beta,
         )
 
-    result = data.copy()
-    result[bcf_col] = _to_long(
-        data=data,
-        values=factors,
-        times=times,
-        station_ids=station_ids,
-        id_col=id_col,
-        date_col=date_col,
-    )
-    return result
+    _run(_station, range(layout.station_ids.size), n_jobs)
+
+    return _frames.with_columns(data, {bcf_col: _to_long(layout, factors)})
 
 
 def apply_flags(
-        data: pd.DataFrame,
+        data: FrameT,
         strict: bool = False,
         precip_col: str = 'precip',
         flag_cols: tuple[str, ...] = ('FZflag', 'HIflag', 'SOflag'),
         bcf_col: str | None = 'BCF',
         out_col: str = 'precip_qc',
-) -> pd.DataFrame:
+) -> FrameT:
     """Apply the flags and the bias correction to the rainfall observations.
 
     :param data: Long format DataFrame with the flag columns of the filters.
+        Either a :class:`pandas.DataFrame` or a :class:`polars.DataFrame`.
     :param strict: If ``False`` only the intervals with a flag of 1 are discarded
         ("filtered flex"), if ``True`` the intervals without enough information to
         determine the flag are discarded as well ("filtered strict").
@@ -587,23 +618,21 @@ def apply_flags(
         apply a bias correction.
     :param out_col: Name of the column the result is written to.
     :return: DataFrame with an additional ``precip_qc`` column where the flagged
-        intervals are NaN.
+        intervals are missing.
     """
-    missing_cols = set(flag_cols) - set(data.columns)
+    missing_cols = set(flag_cols) - set(_frames.columns(data))
     if missing_cols:
         raise ValueError(f"Missing required columns: {sorted(missing_cols)}")
 
-    result = data.copy()
-    precip = result[precip_col].astype(np.float64)
+    precip = _frames.floats(data, precip_col)
     if bcf_col is not None:
-        precip = precip * result[bcf_col]
+        precip = precip * _frames.floats(data, bcf_col)
 
-    discard = np.zeros(len(result), dtype=bool)
+    discard = np.zeros(_frames.n_rows(data), dtype=bool)
     for col in flag_cols:
-        flags = result[col].to_numpy()
+        flags = _frames.values(data, col)
         discard |= flags == FLAG
         if strict:
             discard |= flags == NOT_ENOUGH_INFO
 
-    result[out_col] = precip.mask(discard)
-    return result
+    return _frames.with_columns(data, {out_col: np.where(discard, np.nan, precip)})
